@@ -6,7 +6,7 @@ import os
 import sys
 import sqlite3
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 
@@ -60,6 +60,14 @@ conn.commit()
 
 # ---------- HELPERS ----------
 def allowed(chat_id): return chat_id in WHITELISTED_GROUPS
+
+def daily_vouch_count(user_id, vouch_type="vouch"):
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    cursor.execute(
+        "SELECT COUNT(*) FROM vouches WHERE giver_id=? AND type=? AND created_at LIKE ?",
+        (user_id, vouch_type, f"{today}%"),
+    )
+    return cursor.fetchone()[0]
 
 def is_admin(uid): return uid in ADMIN_IDS
 
@@ -115,10 +123,14 @@ async def vouch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⏳ Slow down.")
         return
 
+    if daily_vouch_count(user.id) >= MAX_VOUCHES_PER_DAY:
+        await update.message.reply_text(f"❌ Daily vouch limit ({MAX_VOUCHES_PER_DAY}) reached.")
+        return
+
     set_cooldown(user.id)
 
     cursor.execute("INSERT INTO vouches (chat_id,giver_id,giver_name,target,reason,type,status,created_at) VALUES (?,?,?,?,?,?,?,?)",
-                   (update.effective_chat.id, user.id, username, target, reason, "vouch", "approved", datetime.utcnow().isoformat()))
+                   (update.effective_chat.id, user.id, username, target, reason, "vouch", "approved", datetime.now(timezone.utc).isoformat()))
     vid = cursor.lastrowid
     conn.commit()
 
@@ -131,6 +143,49 @@ async def vouch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await update.message.reply_text("⚠️ Vouch saved but could not post to feed channel.")
 
+    await log(context, f"✨ VOUCH | @{username} → {target} | {reason}")
+
+# ---------- NEG ----------
+async def neg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update.effective_chat.id): return
+    if len(context.args) < 2: return
+
+    user = update.effective_user
+    target = context.args[0]
+    reason = " ".join(context.args[1:])
+    username = user.username or str(user.id)
+
+    if target.lower() == f"@{username}".lower():
+        await update.message.reply_text("❌ No self-reporting.")
+        return
+
+    if cooldown(user.id) > 0:
+        await update.message.reply_text("⏳ Slow down.")
+        return
+
+    if daily_vouch_count(user.id, "neg") >= MAX_VOUCHES_PER_DAY:
+        await update.message.reply_text(f"❌ Daily report limit ({MAX_VOUCHES_PER_DAY}) reached.")
+        return
+
+    set_cooldown(user.id)
+
+    cursor.execute("INSERT INTO vouches (chat_id,giver_id,giver_name,target,reason,type,status,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                   (update.effective_chat.id, user.id, username, target, reason, "neg", "approved", datetime.now(timezone.utc).isoformat()))
+    vid = cursor.lastrowid
+    conn.commit()
+
+    text = f"⚠️ REPORT\n\n👤 {target}\n📝 {reason}\n\n— @{username}"
+
+    try:
+        msg = await context.bot.send_message(FEED_CHANNEL_ID, text, reply_markup=vote_buttons(vid))
+        cursor.execute("UPDATE vouches SET feed_msg_id=? WHERE id=?", (msg.message_id, vid))
+        conn.commit()
+    except Exception:
+        await update.message.reply_text("⚠️ Report saved but could not post to feed channel.")
+
+    await log(context, f"⚠️ REPORT | @{username} → {target} | {reason}")
+
+
 # ---------- REP ----------
 async def rep(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target = context.args[0] if context.args else (f"@{update.effective_user.username}" if update.effective_user.username else str(update.effective_user.id))
@@ -139,12 +194,12 @@ async def rep(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pos = cursor.fetchone()[0]
 
     cursor.execute("SELECT COUNT(*) FROM vouches WHERE target=? AND type='neg' AND status='approved'", (target,))
-    neg = cursor.fetchone()[0]
+    neg_count = cursor.fetchone()[0]
 
-    score = pos - (neg * 2)
+    score = pos - (neg_count * 2)
     title = get_title(score)
 
-    text = f"📊 {target}\n\n⭐ {pos} | ⚠️ {neg}\n📈 Score: {score}\n🏷 {title}"
+    text = f"📊 {target}\n\n⭐ {pos} | ⚠️ {neg_count}\n📈 Score: {score}\n🏷 {title}"
     await update.message.reply_text(text)
 
 # ---------- LEADERBOARD ----------
@@ -189,6 +244,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("vouch", vouch))
+    app.add_handler(CommandHandler("neg", neg))
     app.add_handler(CommandHandler("rep", rep))
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CallbackQueryHandler(buttons))
