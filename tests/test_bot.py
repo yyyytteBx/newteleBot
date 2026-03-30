@@ -326,9 +326,10 @@ class TestVouch:
         ctx = _make_context(args=["@iris", "solid"])
         ctx.bot.send_message = AsyncMock(return_value=msg_mock)
         await bot.vouch(update, ctx)
-        ctx.bot.send_message.assert_called_once()
-        call_kwargs = ctx.bot.send_message.call_args
-        assert call_kwargs[0][0] == bot.FEED_CHANNEL_ID
+        ctx.bot.send_message.assert_called()
+        # First call must target the feed channel
+        first_call = ctx.bot.send_message.call_args_list[0]
+        assert first_call[0][0] == bot.FEED_CHANNEL_ID
 
     async def test_feed_error_still_saves_vouch(self):
         update = _make_update(user_id=5555, username="jack")
@@ -658,3 +659,244 @@ class TestButtons:
             "SELECT COUNT(*) FROM reactions WHERE vouch_id=? AND reaction='down'", (vid,)
         )
         assert bot.cursor.fetchone()[0] == 1
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# daily_vouch_count()
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestDailyVouchCount:
+    def _insert_today_vouch(self, giver_id, vouch_type="vouch"):
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc).isoformat()
+        bot.cursor.execute(
+            "INSERT INTO vouches (chat_id,giver_id,giver_name,target,reason,type,status,created_at)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (0, giver_id, "sys", "@t", "ok", vouch_type, "approved", today),
+        )
+        bot.conn.commit()
+
+    def test_zero_when_no_vouches(self):
+        assert bot.daily_vouch_count(99999) == 0
+
+    def test_counts_todays_vouches(self):
+        self._insert_today_vouch(10001)
+        self._insert_today_vouch(10001)
+        assert bot.daily_vouch_count(10001) == 2
+
+    def test_does_not_count_other_types(self):
+        self._insert_today_vouch(10002, "vouch")
+        self._insert_today_vouch(10002, "neg")
+        assert bot.daily_vouch_count(10002, "vouch") == 1
+        assert bot.daily_vouch_count(10002, "neg") == 1
+
+    def test_does_not_count_old_vouches(self):
+        bot.cursor.execute(
+            "INSERT INTO vouches (chat_id,giver_id,giver_name,target,reason,type,status,created_at)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (0, 10003, "sys", "@t", "ok", "vouch", "approved", "2000-01-01T00:00:00"),
+        )
+        bot.conn.commit()
+        assert bot.daily_vouch_count(10003) == 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# vouch() – daily limit & log channel
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestVouchDailyLimit:
+    def _fill_daily_vouches(self, giver_id, count=None):
+        from datetime import datetime, timezone
+        n = count if count is not None else bot.MAX_VOUCHES_PER_DAY
+        today = datetime.now(timezone.utc).isoformat()
+        for i in range(n):
+            bot.cursor.execute(
+                "INSERT INTO vouches (chat_id,giver_id,giver_name,target,reason,type,status,created_at)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                (bot.WHITELISTED_GROUPS[0], giver_id, "limiter", f"@t{i}", "ok", "vouch", "approved", today),
+            )
+        bot.conn.commit()
+
+    async def test_daily_limit_blocks_vouch(self):
+        self._fill_daily_vouches(20001)
+        update = _make_update(user_id=20001, username="limiter")
+        ctx = _make_context(args=["@newperson", "test"])
+        await bot.vouch(update, ctx)
+        update.message.reply_text.assert_called_once()
+        text = update.message.reply_text.call_args[0][0]
+        assert "❌" in text
+        assert "limit" in text.lower() or str(bot.MAX_VOUCHES_PER_DAY) in text
+
+    async def test_daily_limit_allows_up_to_max(self):
+        self._fill_daily_vouches(20002, bot.MAX_VOUCHES_PER_DAY - 1)
+        update = _make_update(user_id=20002, username="almostdone")
+        ctx = _make_context(args=["@newcomer", "good"])
+        ctx.bot.send_message = AsyncMock(return_value=MagicMock(message_id=1))
+        await bot.vouch(update, ctx)
+        bot.cursor.execute("SELECT COUNT(*) FROM vouches WHERE giver_id=20002")
+        assert bot.cursor.fetchone()[0] == bot.MAX_VOUCHES_PER_DAY
+
+    async def test_daily_limit_does_not_block_different_type(self):
+        """Filling the vouch limit should not prevent a /neg."""
+        self._fill_daily_vouches(20003)
+        # daily_vouch_count(..., "neg") should still be 0
+        assert bot.daily_vouch_count(20003, "neg") == 0
+
+
+class TestVouchLogsToChannel:
+    async def test_log_channel_notified_on_success(self):
+        msg_mock = MagicMock()
+        msg_mock.message_id = 1
+        update = _make_update(user_id=30001, username="logger")
+        ctx = _make_context(args=["@target", "great"])
+        ctx.bot.send_message = AsyncMock(return_value=msg_mock)
+        await bot.vouch(update, ctx)
+        # send_message called at least twice: feed + log
+        assert ctx.bot.send_message.call_count >= 2
+        # Last call is the log call to LOG_CHANNEL_ID
+        last_call = ctx.bot.send_message.call_args_list[-1]
+        assert last_call[0][0] == bot.LOG_CHANNEL_ID
+
+    async def test_log_channel_notified_even_when_feed_fails(self):
+        call_count = 0
+
+        async def side_effect(channel_id, *args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if channel_id == bot.FEED_CHANNEL_ID:
+                raise Exception("feed down")
+            return MagicMock(message_id=1)
+
+        update = _make_update(user_id=30002, username="logger2")
+        ctx = _make_context(args=["@target2", "ok"])
+        ctx.bot.send_message = AsyncMock(side_effect=side_effect)
+        await bot.vouch(update, ctx)
+        # Log call should still be attempted
+        assert call_count >= 2
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# neg()
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestNeg:
+    async def test_disallowed_chat_returns_early(self):
+        update = _make_update(chat_id=9999)
+        ctx = _make_context(args=["@someone", "scammer"])
+        await bot.neg(update, ctx)
+        update.message.reply_text.assert_not_called()
+        bot.cursor.execute("SELECT COUNT(*) FROM vouches WHERE type='neg'")
+        assert bot.cursor.fetchone()[0] == 0
+
+    async def test_insufficient_args_returns_early(self):
+        update = _make_update()
+        ctx = _make_context(args=["@someone"])
+        await bot.neg(update, ctx)
+        update.message.reply_text.assert_not_called()
+
+    async def test_no_args_returns_early(self):
+        update = _make_update()
+        ctx = _make_context(args=[])
+        await bot.neg(update, ctx)
+        update.message.reply_text.assert_not_called()
+
+    async def test_self_neg_is_rejected(self):
+        update = _make_update(username="alice")
+        ctx = _make_context(args=["@alice", "bad"])
+        await bot.neg(update, ctx)
+        update.message.reply_text.assert_called_once()
+        text = update.message.reply_text.call_args[0][0]
+        assert "❌" in text
+
+    async def test_self_neg_case_insensitive(self):
+        update = _make_update(username="Alice")
+        ctx = _make_context(args=["@alice", "bad"])
+        await bot.neg(update, ctx)
+        update.message.reply_text.assert_called_once()
+
+    async def test_cooldown_blocks_neg(self):
+        bot.set_cooldown(40001)
+        update = _make_update(user_id=40001, username="bob2")
+        ctx = _make_context(args=["@carol2", "scam"])
+        await bot.neg(update, ctx)
+        update.message.reply_text.assert_called_once()
+        text = update.message.reply_text.call_args[0][0]
+        assert "⏳" in text or "slow" in text.lower()
+
+    async def test_successful_neg_saves_to_db(self):
+        update = _make_update(user_id=40002, username="dave2")
+        ctx = _make_context(args=["@eve2", "dishonest"])
+        ctx.bot.send_message = AsyncMock(return_value=MagicMock(message_id=1))
+        await bot.neg(update, ctx)
+        bot.cursor.execute("SELECT target, reason, type, status FROM vouches WHERE giver_id=40002")
+        row = bot.cursor.fetchone()
+        assert row is not None
+        assert row[0] == "@eve2"
+        assert row[1] == "dishonest"
+        assert row[2] == "neg"
+        assert row[3] == "approved"
+
+    async def test_successful_neg_sets_cooldown(self):
+        update = _make_update(user_id=40003, username="frank2")
+        ctx = _make_context(args=["@grace2", "fraud"])
+        ctx.bot.send_message = AsyncMock(return_value=MagicMock(message_id=1))
+        await bot.neg(update, ctx)
+        assert bot.cooldown(40003) > 0
+
+    async def test_successful_neg_posts_to_feed(self):
+        msg_mock = MagicMock()
+        msg_mock.message_id = 888
+        update = _make_update(user_id=40004, username="hank2")
+        ctx = _make_context(args=["@iris2", "scam"])
+        ctx.bot.send_message = AsyncMock(return_value=msg_mock)
+        await bot.neg(update, ctx)
+        ctx.bot.send_message.assert_called()
+        first_call = ctx.bot.send_message.call_args_list[0]
+        assert first_call[0][0] == bot.FEED_CHANNEL_ID
+
+    async def test_feed_error_still_saves_neg(self):
+        update = _make_update(user_id=40005, username="jack2")
+        ctx = _make_context(args=["@karen2", "bad"])
+        ctx.bot.send_message = AsyncMock(side_effect=Exception("channel error"))
+        await bot.neg(update, ctx)
+        bot.cursor.execute("SELECT COUNT(*) FROM vouches WHERE giver_id=40005 AND type='neg'")
+        assert bot.cursor.fetchone()[0] == 1
+        update.message.reply_text.assert_called_once()
+        assert "⚠️" in update.message.reply_text.call_args[0][0]
+
+    async def test_neg_uses_user_id_when_no_username(self):
+        update = _make_update(user_id=40006, username=None)
+        ctx = _make_context(args=["@pete2", "fraud"])
+        ctx.bot.send_message = AsyncMock(return_value=MagicMock(message_id=1))
+        await bot.neg(update, ctx)
+        bot.cursor.execute("SELECT giver_name FROM vouches WHERE giver_id=40006")
+        row = bot.cursor.fetchone()
+        assert row[0] == "40006"
+
+    async def test_neg_daily_limit(self):
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc).isoformat()
+        for i in range(bot.MAX_VOUCHES_PER_DAY):
+            bot.cursor.execute(
+                "INSERT INTO vouches (chat_id,giver_id,giver_name,target,reason,type,status,created_at)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                (bot.WHITELISTED_GROUPS[0], 40007, "reporter", f"@t{i}", "ok", "neg", "approved", today),
+            )
+        bot.conn.commit()
+        update = _make_update(user_id=40007, username="reporter")
+        ctx = _make_context(args=["@newbadguy", "scam"])
+        await bot.neg(update, ctx)
+        update.message.reply_text.assert_called_once()
+        text = update.message.reply_text.call_args[0][0]
+        assert "❌" in text
+
+    async def test_neg_log_channel_notified(self):
+        msg_mock = MagicMock()
+        msg_mock.message_id = 1
+        update = _make_update(user_id=40008, username="logger3")
+        ctx = _make_context(args=["@badactor", "scam"])
+        ctx.bot.send_message = AsyncMock(return_value=msg_mock)
+        await bot.neg(update, ctx)
+        assert ctx.bot.send_message.call_count >= 2
+        last_call = ctx.bot.send_message.call_args_list[-1]
+        assert last_call[0][0] == bot.LOG_CHANNEL_ID
