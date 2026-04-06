@@ -9,10 +9,30 @@ import time
 from datetime import datetime, timezone
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+from telethon.tl.functions.contacts import ImportContactsRequest
+from telethon.tl.types import InputPhoneContact
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     sys.exit("ERROR: BOT_TOKEN environment variable is not set. Exiting.")
+
+# Telethon userbot client (needed to resolve phone numbers / user IDs)
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
+SESSION_STRING = os.getenv("SESSION_STRING", "")
+
+_telethon_client: TelegramClient | None = None
+
+def get_telethon_client() -> TelegramClient | None:
+    """Return a (possibly cached) Telethon client, or None if not configured."""
+    global _telethon_client
+    if not API_ID or not API_HASH or not SESSION_STRING:
+        return None
+    if _telethon_client is None:
+        _telethon_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+    return _telethon_client
 
 FEED_CHANNEL_ID = -1003744224655
 LOG_CHANNEL_ID = -1003305030576
@@ -239,6 +259,59 @@ async def buttons(update, context):
 
     await q.edit_message_reply_markup(vote_buttons(vid, up, down))
 
+# ---------- LOOKUP (admin-only, Telethon) ----------
+async def lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Usage: /lookup <phone|user_id>
+    Resolves a phone number or numeric Telegram user ID to profile info.
+    Admin-only.
+    """
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Admins only.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /lookup <phone_number or user_id>")
+        return
+
+    query = context.args[0].strip()
+
+    client = get_telethon_client()
+    if client is None:
+        await update.message.reply_text("⚠️ Telethon is not configured (API_ID / API_HASH / SESSION_STRING missing).")
+        return
+
+    try:
+        async with client:
+            if query.lstrip("+").isdigit() and not query.startswith("+"):
+                # Numeric ID lookup
+                entity = await client.get_entity(int(query))
+            else:
+                # Phone number lookup — import as a temporary contact
+                result = await client(ImportContactsRequest([
+                    InputPhoneContact(client_id=0, phone=query, first_name="Lookup", last_name="")
+                ]))
+                if not result.users:
+                    await update.message.reply_text("❌ No Telegram account found for that phone number.")
+                    return
+                entity = result.users[0]
+
+        uid = entity.id
+        first = getattr(entity, "first_name", "") or ""
+        last = getattr(entity, "last_name", "") or ""
+        username = getattr(entity, "username", None)
+        name = f"{first} {last}".strip() or "—"
+        uname_str = f"@{username}" if username else "—"
+
+        await update.message.reply_text(
+            f"🔍 Lookup Result\n\n"
+            f"👤 Name: {name}\n"
+            f"🆔 Account ID: {uid}\n"
+            f"📛 Username: {uname_str}"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Lookup failed: {e}")
+
+
 # ---------- MAIN ----------
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
@@ -247,6 +320,7 @@ def main():
     app.add_handler(CommandHandler("neg", neg))
     app.add_handler(CommandHandler("rep", rep))
     app.add_handler(CommandHandler("leaderboard", leaderboard))
+    app.add_handler(CommandHandler("lookup", lookup))
     app.add_handler(CallbackQueryHandler(buttons))
 
     print("NTN POLISHED BOT RUNNING")
