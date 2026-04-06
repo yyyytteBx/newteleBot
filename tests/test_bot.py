@@ -900,3 +900,72 @@ class TestNeg:
         assert ctx.bot.send_message.call_count >= 2
         last_call = ctx.bot.send_message.call_args_list[-1]
         assert last_call[0][0] == bot.LOG_CHANNEL_ID
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# user_client (Telethon session login)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestUserClient:
+    def test_user_client_none_without_env_vars(self):
+        """user_client is None when session env vars are absent."""
+        import os
+        from unittest.mock import patch
+
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("API_ID", "API_HASH", "SESSION_STRING")}
+
+        with patch.dict(os.environ, env, clear=True):
+            import importlib
+            import sys
+            mod_name = "ntn_mega_vouch_bot_polished"
+            saved = sys.modules.pop(mod_name, None)
+            try:
+                with patch("sqlite3.connect", return_value=bot.conn):
+                    fresh = importlib.import_module(mod_name)
+                assert fresh.user_client is None
+            finally:
+                if saved is not None:
+                    sys.modules[mod_name] = saved
+                else:
+                    sys.modules.pop(mod_name, None)
+
+    def test_user_client_created_with_env_vars(self):
+        """user_client is set to a TelegramClient when all session env vars are present."""
+        import os
+        import importlib
+        import sys
+        from unittest.mock import patch, MagicMock
+
+        mock_client_instance = MagicMock(name="client_instance")
+        mock_client_cls = MagicMock(name="TelegramClient", return_value=mock_client_instance)
+        mock_string_session = MagicMock(name="StringSession")
+
+        telethon_stub = sys.modules["telethon"]
+        telethon_sessions_stub = sys.modules["telethon.sessions"]
+
+        orig_client_cls = telethon_stub.TelegramClient
+        orig_session_cls = telethon_sessions_stub.StringSession
+
+        telethon_stub.TelegramClient = mock_client_cls
+        telethon_sessions_stub.StringSession = mock_string_session
+
+        env_patch = {"API_ID": "12345", "API_HASH": "abc123hash", "SESSION_STRING": "fake_session"}
+
+        mod_name = "ntn_mega_vouch_bot_polished"
+        saved = sys.modules.pop(mod_name, None)
+        try:
+            with patch.dict(os.environ, env_patch):
+                with patch("sqlite3.connect", return_value=bot.conn):
+                    fresh = importlib.import_module(mod_name)
+
+            assert fresh.user_client is mock_client_instance
+            mock_string_session.assert_called_once_with("fake_session")
+            mock_client_cls.assert_called_once()
+        finally:
+            telethon_stub.TelegramClient = orig_client_cls
+            telethon_sessions_stub.StringSession = orig_session_cls
+            if saved is not None:
+                sys.modules[mod_name] = saved
+            else:
+                sys.modules.pop(mod_name, None)

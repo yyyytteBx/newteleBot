@@ -4,15 +4,27 @@
 
 import os
 import sys
+import asyncio
+import signal
 import sqlite3
 import time
 from datetime import datetime, timezone
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
+from telethon import TelegramClient
+from telethon.sessions import StringSession
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     sys.exit("ERROR: BOT_TOKEN environment variable is not set. Exiting.")
+
+API_ID = os.getenv("API_ID")
+API_HASH = os.getenv("API_HASH")
+SESSION_STRING = os.getenv("SESSION_STRING")
+
+user_client = None
+if API_ID and API_HASH and SESSION_STRING:
+    user_client = TelegramClient(StringSession(SESSION_STRING), int(API_ID), API_HASH)
 
 FEED_CHANNEL_ID = -1003744224655
 LOG_CHANNEL_ID = -1003305030576
@@ -249,8 +261,25 @@ def main():
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CallbackQueryHandler(buttons))
 
-    print("NTN POLISHED BOT RUNNING")
-    app.run_polling()
+    if user_client is not None:
+        async def _run():
+            stop_event = asyncio.Event()
+
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, stop_event.set)
+
+            await user_client.start()
+            print("NTN POLISHED BOT RUNNING (user session active)")
+            async with app:
+                await app.updater.start_polling()
+                await stop_event.wait()
+                await app.updater.stop()
+
+        asyncio.run(_run())
+    else:
+        print("NTN POLISHED BOT RUNNING")
+        app.run_polling()
 
 if __name__ == "__main__":
     main()

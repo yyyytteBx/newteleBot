@@ -4,7 +4,8 @@ Conftest: sets up environment and mocks *before* the bot module is imported.
 Execution order matters:
   1. BOT_TOKEN must be in os.environ
   2. telegram / telegram.ext stubs must be in sys.modules
-  3. sqlite3.connect must be patched to return a shared in-memory DB
+  3. telethon / telethon.sessions stubs must be in sys.modules
+  4. sqlite3.connect must be patched to return a shared in-memory DB
 
 All of these must happen before ``import ntn_mega_vouch_bot_polished``.
 """
@@ -37,13 +38,23 @@ _telegram_ext_stub.CallbackQueryHandler = MagicMock(name="CallbackQueryHandler")
 sys.modules.setdefault("telegram", _telegram_stub)
 sys.modules.setdefault("telegram.ext", _telegram_ext_stub)
 
-# ── 3. Shared in-memory SQLite database ───────────────────────────────────────
+# ── 3. Stub out telethon packages ─────────────────────────────────────────────
+_telethon_stub = MagicMock(name="telethon")
+_telethon_sessions_stub = MagicMock(name="telethon.sessions")
+
+_telethon_stub.TelegramClient = MagicMock(name="TelegramClient")
+_telethon_sessions_stub.StringSession = MagicMock(name="StringSession")
+
+sys.modules.setdefault("telethon", _telethon_stub)
+sys.modules.setdefault("telethon.sessions", _telethon_sessions_stub)
+
+# ── 4. Shared in-memory SQLite database ───────────────────────────────────────
 # We create one in-memory connection and hand it back every time
 # ``sqlite3.connect`` is called during module import.
 
 _in_memory_conn = sqlite3.connect(":memory:", check_same_thread=False)
 
-# ── 4. Import the bot module under the patches ────────────────────────────────
+# ── 5. Import the bot module under the patches ────────────────────────────────
 with patch("sqlite3.connect", return_value=_in_memory_conn):
     import ntn_mega_vouch_bot_polished as _bot_module  # noqa: E402
 
